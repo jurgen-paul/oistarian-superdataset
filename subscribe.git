@@ -1,20 +1,372 @@
-const stripe = require('stripe')('your_secret_key'); // Replace with your Stripe secret key
+// stripe-saas-auto.js
+import Stripe from 'stripe';
+import express from 'express';
+import dotenv from 'dotenv';
 
-async function createSubscription(customerId, priceId) {
+dotenv.config();
+
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, {
+  apiVersion: '2023-11-15',
+});
+
+const app = express();
+app.use(express.json()); // Parse JSON for webhooks
+
+// Mock database and email notification functions
+const Database = {
+  updateSubscriptionStatus: async (customerId, subscriptionId, status) => {
+    console.log(`DB Update: Customer ${customerId}, Subscription ${subscriptionId}, Status ${status}`);
+    // Implement actual DB logic here
+  }
+};
+
+const EmailService = {
+  notifyCustomer: async (customerEmail, subject, message) => {
+    console.log(`Email sent to ${customerEmail}: ${subject} - ${message}`);
+    // Implement real email sending here
+  }
+};
+
+/**
+ * Create a subscription for a customer with trial, coupon, and automatic payment handling
+ */
+async function createSubscription({
+  customerId,
+  priceId,
+  organizationId,
+  trialDays = 0,
+  couponId,
+}) {
+  if (!customerId || !priceId) throw new Error('Customer ID and Price ID required');
+
   try {
-    const subscription = await stripe.subscriptions.create({
+    const subscriptionParams = {
       customer: customerId,
       items: [{ price: priceId }],
-      metadata: { organization_id: 'org_6RsNhnGbSQ3s7rFPAoYfQjA' },
-    });
-    console.log('Subscription created:', subscription.id);
+      payment_behavior: 'default_incomplete',
+      expand: ['latest_invoice.payment_intent', 'customer'],
+      metadata: organizationId ? { organization_id: organizationId } : undefined,
+      // Automatic retry settings can also be configured in the Stripe Dashboard
+    };
+
+    if (trialDays > 0) subscriptionParams.trial_period_days = trialDays;
+    if (couponId) subscriptionParams.coupon = couponId;
+
+    const subscription = await stripe.subscriptions.create(subscriptionParams);
+    const paymentIntent = subscription.latest_invoice?.payment_intent;
+
+    if (paymentIntent && paymentIntent.status === 'requires_action') {
+      return { subscription, clientSecret: paymentIntent.client_secret };
+    }
+
+    return { subscription };
   } catch (error) {
-    console.error('Error creating subscription:', error);
+    console.error('Error creating subscription:', error.message);
+    throw error;
   }
 }
 
-// Example usage
-const customerId = 'cus_xxxxxxxxxxxxx'; // Replace with your customer ID
-const priceId = 'price_xxxxxxxxxxxxx'; // Replace with your price ID
+/**
+ * Stripe webhook endpoint for subscription lifecycle events
+ */
+app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
+  const sig = req.headers['stripe-signature'];
+  let event;
 
-createSubscription(customerId, priceId);
+  try {
+    event = stripe.webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET);
+  } catch (err) {
+    console.error('Webhook signature verification failed:', err.message);
+    return res.status(400).send(`Webhook Error: ${err.message}`);
+  }
+
+  const data = event.data.object;
+  const customerEmail = data.customer_email || (data.customer?.email || 'unknown');
+
+  switch (event.type) {
+    case 'invoice.payment_succeeded':
+      console.log('✅ Payment succeeded:', data.subscription);
+      await Database.updateSubscriptionStatus(data.customer, data.subscription, 'active');
+      await EmailService.notifyCustomer(customerEmail, 'Payment Successful', 'Your subscription payment was successful!');
+      break;
+
+    case 'invoice.payment_failed':
+      console.log('❌ Payment failed:', data.subscription);
+      await Database.updateSubscriptionStatus(data.customer, data.subscription, 'past_due');
+      await EmailService.notifyCustomer(
+        customerEmail,
+        'Payment Failed',
+        'Your subscription payment failed. Please update your payment method to avoid service interruption.'
+      );
+      break;
+
+    case 'customer.subscription.deleted':
+      console.log('⚠️ Subscription canceled:', data.id);
+      await Database.updateSubscriptionStatus(data.customer, data.id, 'canceled');
+      await EmailService.notifyCustomer(customerEmail, 'Subscription Canceled', 'Your subscription has been canceled.');
+      break;
+
+    case 'customer.subscription.updated':
+      console.log('ℹ️ Subscription updated:', data.id, 'Status:', data.status);
+      await Database.updateSubscriptionStatus(data.customer, data.id, data.status);
+      break;
+
+    default:
+      console.log(`Unhandled event type: ${event.type}`);
+  }
+
+  res.json({ received: true });
+});
+
+// Example usage
+(async () => {
+  try {
+    const { subscription, clientSecret } = await createSubscription({
+      customerId: 'cus_xxxxxxxxxxxxx',
+      priceId: 'price_xxxxxxxxxxxxx',
+      organizationId: 'org_6RsNhnGbSQ3s7rFPAoYfQjA',
+      trialDays: 14,
+      couponId: 'coupon_xxxxx',
+    });
+
+    console.log('Subscription created:', subscription.id);
+    if (clientSecret) console.log('Client action required (3DSecure):', clientSecret);
+  } catch (err) {
+    console.error('Failed to create subscription:', err);
+  }
+})();
+
+const PORT = process.env.PORT || 4242;
+app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+
+saas-subscription/
+├─ backend/
+│  ├─ server.js
+│  ├─ .env
+│  └─ package.json
+├─ frontend/
+│  ├─ src/
+│  │  ├─ App.jsx
+│  │  ├─ SubscriptionForm.jsx
+│  │  └─ index.jsx
+│  ├─ package.json
+│  └─ vite.config.js
+├─ README.md
+{
+  "name": "saas-backend",
+  "version": "1.0.0",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "nodemon server.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "dotenv": "^16.0.3",
+    "express": "^4.18.2",
+    "stripe": "^12.16.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.2"
+  }
+}
+PORT=4242
+STRIPE_SECRET_KEY=sk_test_YourSecretKey
+STRIPE_WEBHOOK_SECRET=whsec_YourWebhookSecret
+// server.js
+import express from 'express';
+import Stripe from 'stripe';
+import dotenv from 'dotenv';
+import cors from 'cors';
+
+dotenv.config();
+
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, { apiVersion: '2023-11-15' });
+
+const app = express();
+app.use(cors());
+app.use(express.json());
+
+// Mock database
+const Database = {
+  users: {}, // { email: { customerId, subscriptionId, status } }
+  saveUser: function(email, customerId) { this.users[email] = { customerId, status: 'pending' }; },
+  updateSubscription: function(email, subscriptionId, status) { this.users[email].subscriptionId = subscriptionId; this.users[email].status = status; },
+  getUser: function(email) { return this.users[email]; }
+};
+
+// Mock email service
+const EmailService = {
+  send: async (email, subject, message) => console.log(`Email to ${email}: ${subject} - ${message}`)
+};
+
+/**
+ * Create Stripe customer + subscription
+ */
+app.post('/create-subscription', async (req, res) => {
+  const { email, priceId, trialDays = 14, couponId } = req.body;
+  if (!email || !priceId) return res.status(400).json({ error: 'Email and priceId required' });
+
+  try {
+    // Create Stripe customer
+    const customer = await stripe.customers.create({ email });
+    Database.saveUser(email, customer.id);
+
+    // Create subscription
+    const subscriptionParams = {
+      customer: customer.id,
+      items: [{ price: priceId }],
+      payment_behavior: 'default_incomplete',
+      expand: ['latest_invoice.payment_intent', 'customer'],
+      trial_period_days: trialDays,
+      coupon: couponId || undefined
+    };
+
+    const subscription = await stripe.subscriptions.create(subscriptionParams);
+    const paymentIntent = subscription.latest_invoice.payment_intent;
+
+    Database.updateSubscription(email, subscription.id, subscription.status);
+
+    // If 3D Secure required, return client_secret
+    if (paymentIntent.status === 'requires_action') {
+      return res.json({ subscriptionId: subscription.id, clientSecret: paymentIntent.client_secret });
+    }
+
+    res.json({ subscriptionId: subscription.id, status: subscription.status });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to create subscription' });
+  }
+});
+
+/**
+ * Stripe webhook
+ */
+app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
+  const sig = req.headers['stripe-signature'];
+  let event;
+  try {
+    event = stripe.webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET);
+  } catch (err) {
+    console.error('Webhook signature verification failed:', err.message);
+    return res.status(400).send(`Webhook Error: ${err.message}`);
+  }
+
+  const data = event.data.object;
+  const customerEmail = Object.keys(Database.users).find(email => Database.users[email].customerId === data.customer) || 'unknown@example.com';
+
+  switch (event.type) {
+    case 'invoice.payment_succeeded':
+      Database.updateSubscription(customerEmail, data.subscription, 'active');
+      await EmailService.send(customerEmail, 'Payment Successful', 'Your subscription payment succeeded.');
+      break;
+    case 'invoice.payment_failed':
+      Database.updateSubscription(customerEmail, data.subscription, 'past_due');
+      await EmailService.send(customerEmail, 'Payment Failed', 'Please update your payment method to avoid interruption.');
+      break;
+    case 'customer.subscription.deleted':
+      Database.updateSubscription(customerEmail, data.id, 'canceled');
+      await EmailService.send(customerEmail, 'Subscription Canceled', 'Your subscription was canceled.');
+      break;
+    case 'customer.subscription.updated':
+      Database.updateSubscription(customerEmail, data.id, data.status);
+      break;
+    default:
+      console.log(`Unhandled event type: ${event.type}`);
+  }
+
+  res.json({ received: true });
+});
+
+const PORT = process.env.PORT || 4242;
+app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+{
+  "name": "saas-frontend",
+  "version": "1.0.0",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@stripe/react-stripe-js": "^2.8.0",
+    "@stripe/stripe-js": "^2.30.0",
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^4.0.0",
+    "vite": "^4.4.0"
+  }
+}
+import { defineConfig } from 'vite';
+import react from '@vitejs/plugin-react';
+
+export default defineConfig({
+  plugins: [react()],
+  server: {
+    proxy: {
+      '/create-subscription': 'http://localhost:4242',
+      '/webhook': 'http://localhost:4242'
+    }
+  }
+});
+import { useState } from 'react';
+import { useStripe, useElements, CardElement } from '@stripe/react-stripe-js';
+
+export default function SubscriptionForm({ priceId }) {
+  const stripe = useStripe();
+  const elements = useElements();
+  const [email, setEmail] = useState('');
+
+  const handleSubmit = async (e) => {
+    e.preventDefault();
+    const res = await fetch('/create-subscription', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email, priceId })
+    });
+    const data = await res.json();
+
+    if (data.clientSecret) {
+      const result = await stripe.confirmCardPayment(data.clientSecret, {
+        payment_method: { card: elements.getElement(CardElement) }
+      });
+      if (result.error) alert(result.error.message);
+      else alert('Subscription successful!');
+    } else {
+      alert('Subscription created successfully!');
+    }
+  };
+
+  return (
+    <form onSubmit={handleSubmit}>
+      <input type="email" placeholder="Email" value={email} onChange={e => setEmail(e.target.value)} required />
+      <CardElement />
+      <button type="submit">Subscribe</button>
+    </form>
+  );
+}
+import { loadStripe } from '@stripe/stripe-js';
+import { Elements } from '@stripe/react-stripe-js';
+import SubscriptionForm from './SubscriptionForm';
+
+const stripePromise = loadStripe('pk_test_YourPublicKey');
+
+export default function App() {
+  return (
+    <Elements stripe={stripePromise}>
+      <SubscriptionForm priceId="price_xxxxxxxxxxxxx" />
+    </Elements>
+  );
+}
+import React from 'react';
+import ReactDOM from 'react-dom/client';
+import App from './App';
+import './index.css';
+
+ReactDOM.createRoot(document.getElementById('root')).render(
+  <React.StrictMode>
+    <App />
+  </React.StrictMode>
+);
